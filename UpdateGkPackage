@@ -1,9 +1,1429 @@
-_>_Vers_-> Yes_Update_12_0
+#!/bin/sh
+# # # # # # # # # # # # ## # # # # # # # # # # ## # # # # # # # # # # ## # # # # # # # # # # # # #  
+# AddAndRemoveAppsPortable
+# GkPackage 
+# GkPackage Software Manager for AppImage is a voluntary and nonprofit (GPL license) project. And 
+#everything possible is done to ensure that everything work good and it's safe to install. If you 
+#decide to install this AppImage app in your Linux system you do it at your own risk.
+# By Gioank
+# # # # # # # # # # # # ## # # # # # # # # # # ## # # # # # # # # # # ## # # # # # # # # # # # # # 
+#
+clear
 
-_>_Link_->  
+mkdir -p /tmp/.GKWhoUSER
+set -euf
 
-_>_OpenLink_-> 
+OIFS="$IFS"
+N='
+'
+SELF_NAME=${0##*/}
+RSEP=$(printf '%b' '\036')
 
-_>_LinkScript_->
+USEP=$(printf '%b' '\037')
+error() {
+printf '%s\n' "$@" >&2
+}
 
-_>_Script_->
+check_bool() {
+case "$1" in
+true | True | TRUE | yes | Yes | YES | 1) return 0 ;;
+false | False | FALSE | no | No | NO | 0) return 1 ;;
+*)
+error "Assuming '$1' means no"
+return 1
+;;
+esac
+}
+
+if check_bool "${DEBUG-0}"; then
+debug() { printf 'D: %s\n' "$@" >&2; }
+else
+debug() { :; }
+fi
+make_paths() {
+IFS=':'
+for dir in ${XDG_CONFIG_HOME:-"${HOME}/.config"}${IFS}${XDG_CONFIG_DIRS:-/etc/xdg}; do
+for desktop in ${LOWERCASE_XDG_CURRENT_DESKTOP}; do
+CONFIGS=${CONFIGS:+${CONFIGS}${IFS}}${dir%/}/${desktop}-xdg-terminals.list
+done
+CONFIGS=${CONFIGS:+${CONFIGS}${IFS}}${dir%/}/xdg-terminals.list
+done
+for dir in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
+for desktop in ${LOWERCASE_XDG_CURRENT_DESKTOP}; do
+CONFIGS=${CONFIGS:+${CONFIGS}${IFS}}${dir%/}/xdg-terminal-exec/${desktop}-xdg-terminals.list
+done
+CONFIGS=${CONFIGS:+${CONFIGS}${IFS}}${dir%/}/xdg-terminal-exec/xdg-terminals.list
+done
+for dir in ${XDG_DATA_HOME:-${HOME}/.local/share}${IFS}${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
+APPLICATIONS_DIRS=${dir%/}/applications/${APPLICATIONS_DIRS:+${IFS}${APPLICATIONS_DIRS}}
+done
+
+XDG_CACHE_HOME=${XDG_CACHE_HOME:-"${HOME}/.cache"}
+CACHE_FILE="${XDG_CACHE_HOME}/xdg-terminal-exec"
+
+debug "paths:" "CONFIGS=${CONFIGS}" "APPLICATIONS_DIRS=${APPLICATIONS_DIRS}"
+}
+alias make_paths='IFS= make_paths'
+gen_hash() {
+read -r hash _drop <<- EOH
+$(
+hash_paths="${CONFIGS}:${APPLICATIONS_DIRS}"
+{
+echo 3
+echo "${XDG_CURRENT_DESKTOP-}"
+IFS=':'
+debug ">     hashing '${XDG_CURRENT_DESKTOP-}' and listing of:" $hash_paths "^     end of hash listing"
+LANG=C ls -LRl ${hash_paths} 2> /dev/null
+} | md5sum 2> /dev/null
+)
+EOH
+case "$hash" in
+[0-9a-f]??????????????????????????????[0-9a-f])
+debug "got fresh hash '$hash'"
+echo "$hash"
+return 0
+;;
+*)
+debug "failed to get fresh hash, got '$hash'"
+return 1
+;;
+esac
+}
+
+read_cache() {
+if [ -f "${CACHE_FILE}" ]; then
+line_num=0
+line_limit=50
+cached_exec_usep=
+finished=0
+while IFS='' read -r line; do
+line_num=$((line_num + 1))
+case "${line_num}" in
+1) cached_hash=$line ;;
+2) cached_cmd=$line ;;
+3) cached_execarg=$line ;;
+4) cached_appidarg=$line ;;
+5) cached_titlearg=$line ;;
+6) cached_dirarg=$line ;;
+7) cached_holdarg=$line ;;
+"$line_limit")
+debug "reached cache line limit ($line_limit)"
+return 1
+;;
+*)
+cached_exec_usep=${cached_exec_usep}${cached_exec_usep:+$N}${line}
+case "${line}" in
+*"${RSEP}END_OF_EXEC_USEP")
+cached_exec_usep=${cached_exec_usep%"${RSEP}END_OF_EXEC_USEP"}
+finished=1
+break
+;;
+esac
+;;
+esac
+done < "${CACHE_FILE}"
+if [ "$finished" = "1" ]; then
+debug "got cache:" \
+"hash=${cached_hash}" \
+"cmd=${cached_cmd}" \
+"execarg=${cached_execarg}" \
+"appidarg=${cached_appidarg}" \
+"titlearg=${cached_titlearg}" \
+"dirarg=${cached_dirarg}" \
+"holdarg=${cached_holdarg}" \
+"exec_usep=${cached_exec_usep}"
+HASH=$(gen_hash) || return 1
+if [ "$HASH" = "$cached_hash" ] && command -v "$cached_cmd" > /dev/null; then
+debug "cache is actual"
+EXEC_USEP=${cached_exec_usep}
+EXECARG=${cached_execarg}
+APPIDARG=${cached_appidarg}
+TITLEARG=${cached_titlearg}
+DIRARG=${cached_dirarg}
+HOLDARG=${cached_holdarg}
+return 0
+else
+debug "cache is out-of-date"
+return 1
+fi
+else
+debug "invalid cache data"
+return 1
+fi
+else
+debug "no cache data"
+return 1
+fi
+}
+
+save_cache() {
+if check_bool "$CACHE_ENABLED"; then
+[ ! -d "${XDG_CACHE_HOME}" ] && mkdir -p "${XDG_CACHE_HOME}"
+if [ -z "${HASH-}" ]; then
+HASH=$(gen_hash) || {
+error "could not hash listing of files, removing '${CACHE_FILE}'"
+rm -f "${CACHE_FILE}"
+return 0
+}
+fi
+case "${HASH}${1}${EXECARG}${APPIDARG}${TITLEARG}${DIRARG}${HOLDARG}" in
+"$N")
+error "One or more of terminal's arguments contains a newline, removing '${CACHE_FILE}'"
+rm -f "${CACHE_FILE}"
+return 0
+;;
+esac
+UM=$(umask)
+umask 0077
+printf '%s\n' \
+"${HASH}" \
+"${1}" \
+"${EXECARG}" \
+"${APPIDARG}" \
+"${TITLEARG}" \
+"${DIRARG}" \
+"${HOLDARG}" \
+"${EXEC_USEP}${RSEP}END_OF_EXEC_USEP" > "${CACHE_FILE}"
+umask "$UM"
+debug ">     saved cache:" "${HASH}" "${EXEC_USEP}" "${EXECARG}" "${1}" "^     end of saved cache"
+else
+debug "cache is disabled, removing '${CACHE_FILE}'"
+rm -f "${CACHE_FILE}"
+return 0
+fi
+}
+
+list_contains() {
+delimiter=${3:-$N}
+case "${delimiter}${1}${delimiter}" in
+*"${delimiter}${2}${delimiter}"*) return 0 ;;
+*) return 1 ;;
+esac
+}
+
+read_config_paths() {
+
+IFS=':'
+for config_path in ${CONFIGS}; do
+debug "reading config '$config_path'"
+[ -f "$config_path" ] || continue
+while IFS="$OIFS" read -r line; do
+case $line in
+/enable_cache)
+debug "found '$line' directive${CACHE_CONFIGURED:+ (ignored)}"
+[ -z "$CACHE_CONFIGURED" ] || continue
+CACHE_ENABLED=true
+CACHE_CONFIGURED=1
+;;
+/disable_cache)
+debug "found '$line' directive${CACHE_CONFIGURED:+ (ignored)}"
+[ -z "$CACHE_CONFIGURED" ] || continue
+CACHE_ENABLED=false
+CACHE_CONFIGURED=1
+;;
+/execarg_compat)
+debug "found '$line' directive${EXECARG_COMPAT_CONFIGURED:+ (ignored)}"
+[ -z "$EXECARG_COMPAT_CONFIGURED" ] || continue
+EXECARG_COMPAT=true
+EXECARG_COMPAT_CONFIGURED=1
+;;
+/execarg_strict)
+debug "found '$line' directive${EXECARG_COMPAT_CONFIGURED:+ (ignored)}"
+[ -z "$EXECARG_COMPAT_CONFIGURED" ] || continue
+EXECARG_COMPAT=false
+EXECARG_COMPAT_CONFIGURED=1
+;;
+/execarg_default:*:*)
+if ! check_bool "$EXECARG_COMPAT"; then
+debug "ignored directive '$line' (strict mode)"
+continue
+fi
+IFS=':' read -r _directive entry_id execarg_default <<- EOF
+$line
+EOF
+if validate_entry_id "${entry_id}"; then
+debug "added TerminalArgExec default '${execarg_default}' for '${entry_id}'"
+EXECARG_DEFAULTS=${EXECARG_DEFAULTS}${EXECARG_DEFAULTS:+$N}${entry_id}:${execarg_default}
+fi
+;;
+
+[a-zA-Z0-9_]* | [+-][a-zA-Z0-9_]*)
+case "$line" in
+[+-]*)
+_line=${line#[+-]}
+exclusion=${line%"$_line"}
+line=$_line
+;;
+*) exclusion='' ;;
+esac
+IFS=':' read -r entry_id action_id <<- EOL
+$line
+EOL
+if validate_entry_id "${entry_id}" && validate_action_id "${action_id}"; then
+case "$exclusion" in
+'')
+ENTRY_IDS=${ENTRY_IDS:+${ENTRY_IDS}${N}}$line
+debug "added entry ID with action ID '$line'"
+;;
+'+')
+if list_contains "${EXCLUDED_ENTRY_IDS}" "${entry_id}"; then
+debug "entry '${entry_id}' was already excluded from fallback"
+elif list_contains "${INCLUDED_ENTRY_IDS}" "${entry_id}"; then
+debug "entry '${entry_id}' fallback exclusion was already prevented"
+else
+debug "preventing fallback exclusion for entry '${entry_id}'"
+INCLUDED_ENTRY_IDS=${INCLUDED_ENTRY_IDS:+${INCLUDED_ENTRY_IDS}${N}}${entry_id}
+fi
+;;
+'-')
+if list_contains "${INCLUDED_ENTRY_IDS}" "${entry_id}"; then
+debug "entry '${entry_id}' fallback exclusion was already prevented"
+elif list_contains "${EXCLUDED_ENTRY_IDS}" "${entry_id}"; then
+debug "entry '${entry_id}' was already excluded from fallback"
+else
+debug "excluding entry '${entry_id}' from fallback"
+EXCLUDED_ENTRY_IDS=${EXCLUDED_ENTRY_IDS:+${EXCLUDED_ENTRY_IDS}${N}}${entry_id}
+fi
+;;
+esac
+else
+error "Discarded possibly misspelled entry '$line'"
+fi
+;;
+
+esac
+done < "$config_path"
+done
+}
+
+alias read_config_paths='IFS= read_config_paths'
+
+replace() {
+
+r_remainder=${1}
+REPLACED_STR=
+while [ -n "$r_remainder" ]; do
+r_left=${r_remainder%%"$2"*}
+REPLACED_STR=${REPLACED_STR}$r_left
+if [ "$r_left" = "$r_remainder" ]; then
+break
+fi
+REPLACED_STR=${REPLACED_STR}$3
+r_remainder=${r_remainder#*"$2"}
+done
+}
+
+de_expand_str() {
+debug "expander received: $1"
+EXPANDED_STR=
+exp_remainder=$1
+while [ -n "$exp_remainder" ]; do
+exp_left=${exp_remainder%%\\*}
+EXPANDED_STR=${EXPANDED_STR}${exp_left}
+debug "expander appended: $exp_left"
+
+if [ "$exp_left" = "$exp_remainder" ]; then
+debug "expander ended: $EXPANDED_STR"
+break
+fi
+exp_remainder=${exp_remainder#"$exp_left"\\}
+case "$exp_remainder" in
+s*)
+EXPANDED_STR=${EXPANDED_STR}' '
+exp_remainder=${exp_remainder#?}
+debug "expander substituted space"
+;;
+n*)
+EXPANDED_STR=${EXPANDED_STR}$N
+exp_remainder=${exp_remainder#?}
+debug "expander substituted newline"
+;;
+t*)
+EXPANDED_STR=${EXPANDED_STR}''
+exp_remainder=${exp_remainder#?}
+debug "expander substituted tab"
+;;
+r*)
+EXPANDED_STR=${EXPANDED_STR}$(printf '%b' '\r')
+exp_remainder=${exp_remainder#?}
+debug "expander substituted caret return"
+;;
+\\*)
+EXPANDED_STR=${EXPANDED_STR}\\
+exp_remainder=${exp_remainder#?}
+debug "expander substituted backslash"
+;;
+esac
+done
+}
+
+de_tokenize_exec() {
+debug "tokenizer received: $1"
+EXEC_USEP=
+tok_remainder=$1
+tok_quoted=0
+tok_in_space=0
+while [ -n "$tok_remainder" ]; do
+tok_left=${tok_remainder%%[[:space:]\"\`\$\\\'\>\<\~\|\&\;\*\?\#\(\)]*}
+
+EXEC_USEP=${EXEC_USEP}${tok_left}
+debug "tokenizer appended: >$tok_left<"
+
+case "$tok_remainder" in
+"$tok_left")
+debug "tokenizer is out of special chars"
+break
+;;
+esac
+
+tok_remainder=${tok_remainder#"$tok_left"}
+cut=${tok_remainder#?}
+tok_char=${tok_remainder%"$cut"}
+unset cut
+tok_remainder=${tok_remainder#"$tok_char"}
+
+case "${tok_in_space}${tok_left}${tok_char}" in
+1[[:space:]])
+debug "tokenizer still in space :) skipping space character"
+continue
+;;
+1*)
+debug "tokenizer no longer in space :("
+tok_in_space=0
+;;
+esac
+
+case "${tok_quoted}${tok_char}" in
+'1"')
+tok_quoted=0
+debug "tokenizer closed double quotes"
+continue
+;;
+'0"')
+tok_quoted=1
+debug "tokenizer opened double quotes"
+continue
+;;
+0[\`\$\\\'\>\<\~\|\&\;\*\?\#\(\)])
+debug "${entry_id}: Encountered unquoted character: '$tok_char'"
+return 1
+;;
+1[\`\$])
+debug "${entry_id}: Encountered unescaped quoted character: '$tok_char'"
+return 1
+;;
+1\\)
+case "$tok_remainder" in
+'')
+debug "${entry_id}: Dangling backslash encountered!"
+return 1
+;;
+*)
+cut=${tok_remainder#?}
+tok_char=${tok_remainder%"$cut"}
+tok_remainder=${cut}
+unset cut
+EXEC_USEP=${EXEC_USEP}${tok_char}
+debug "tokenizer appended escaped: >$tok_char<"
+;;
+esac
+;;
+0[[:space:]])
+case "${tok_remainder}" in
+*[![:space:]]*)
+EXEC_USEP=${EXEC_USEP}${USEP}
+tok_in_space=1
+debug "tokenizer entered spaaaaaace!!!! separator appended"
+;;
+*)
+debug "tokenizer entered outer spaaaaaace!!!! separator skipped, this is the end"
+break
+;;
+esac
+;;
+1[[:space:]\'\>\<\~\|\&\;\*\?\#\(\)])
+EXEC_USEP=${EXEC_USEP}${tok_char}
+debug "tokenizer appended quoted char: >$tok_char<"
+;;
+*)
+debug "${entry_id}: parsing error at char '$tok_char', (quoted: $tok_quoted)"
+return 1
+;;
+esac
+done
+case "$tok_quoted" in
+1)
+debug "${entry_id}: Double quote was not closed!"
+return 1
+;;
+esac
+debug "tokenizer ended:" "$(
+IFS=$USEP
+printf 'D:     >%s<\n' $EXEC_USEP
+)"
+}
+
+de_strip_fields() {
+exec_usep=''
+fu_found=false
+IFS=$USEP
+for arg in $EXEC_USEP; do
+case "$arg" in
+*[!%]'%'[dDnNvm]* | '%'[dDnNvm]*) debug "injector removed deprecated '$arg'" ;;
+*[!%]'%'[fFuU]* | '%'[fFuU]*)
+if [ "$fu_found" = "true" ]; then
+debug "${entry_id}: Encountered more than one %[fFuU] field!"
+return 1
+fi
+fu_found=true
+debug "injector removed '$arg'"
+continue
+;;
+*[!%]'%i'* | '%i'* | *[!%]'%c'* | '%c'*)
+debug "injector removed '$arg'"
+continue
+;;
+*[!%]%%* | %%*)
+replace "$arg" "%%" "%"
+rarg=$REPLACED_STR
+debug "injector replacing '%%': '$arg' -> '$rarg'"
+exec_usep=${exec_usep}${exec_usep:+$USEP}${rarg}
+;;
+*%?* | *[!%]%)
+debug "${entry_id}: unknown % field in argument '${arg}'"
+return 1
+;;
+*)
+debug "injector keeped: '$arg'"
+exec_usep=${exec_usep}${exec_usep:+$USEP}${arg}
+;;
+esac
+done
+EXEC_USEP=$exec_usep
+IFS=$OIFS
+}
+alias de_strip_fields='IFS= de_strip_fields'
+
+reset_keys() {
+IS_TERMINAL=''
+EXEC_USEP=''
+EXECARG='-e'
+EXECARG_DEFINED=false
+APPIDARG=''
+TITLEARG=''
+DIRARG=''
+HOLDARG=''
+}
+
+find_entry_paths() {
+debug "registering entries"
+
+IFS=':'
+for directory in $APPLICATIONS_DIRS; do
+set -- "$@" "$directory".
+done
+
+set -- "$@" -type f
+
+or_arg=''
+for directory in $APPLICATIONS_DIRS; do
+set -- "$@" ${or_arg} '(' -path "$directory"'./[a-zA-Z0-9_]*.desktop' ! -path "$directory"'./*[^a-zA-Z0-9_./-]*' ')'
+or_arg='-o'
+done
+
+IFS=$N
+while read -r entry_path && read -r entry_id; do
+if list_contains "$EXCLUDED_ENTRY_IDS" "$entry_id"; then
+debug "entry '${entry_id}' was excluded from fallback"
+continue
+fi
+alias "$entry_id"="entry_path='$entry_path'"
+debug "registered '$entry_path' as entry '$entry_id'"
+FALLBACK_ENTRY_IDS=${entry_id}${FALLBACK_ENTRY_IDS:+${N}${FALLBACK_ENTRY_IDS}}
+debug "added fallback ID '$entry_id'"
+done <<- EOE
+$(
+find -L "$@" 2> /dev/null |
+awk '{ print; sub(".*/[.]/", ""); gsub("/", "-"); print }'
+)
+EOE
+}
+alias find_entry_paths='IFS= find_entry_paths'
+
+check_entry_key() {
+key="$1"
+value="$2"
+action="$3"
+read_exec="$4"
+de_checks="$5"
+
+case $key in
+'Categories'*=*)
+debug "checking for 'TerminalEmulator' in Categories '$value'"
+IFS=';'
+for category in $value; do
+[ "$category" = "TerminalEmulator" ] && {
+IS_TERMINAL=true
+return 0
+}
+done
+return 1
+;;
+'Actions'*=*)
+[ -z "$action" ] && return 0
+debug "checking for '$action' in Actions '$value'"
+IFS=';'
+for check_action in $value; do
+if [ "$check_action" = "$action" ]; then
+action_listed=true
+return 0
+fi
+done
+return 1
+;;
+'OnlyShowIn'*=*)
+case "$de_checks" in
+true) debug "checking for intersecion between '${XDG_CURRENT_DESKTOP-}' and OnlyShowIn '$value'" ;;
+false)
+debug "skipping OnlyShowIn check"
+return 0
+;;
+esac
+IFS=';'
+for target in $value; do
+IFS=':'
+for desktop in ${XDG_CURRENT_DESKTOP-}; do
+[ "$desktop" = "$target" ] && return 0
+done
+done
+return 1
+;;
+'NotShowIn'*=*)
+case "$de_checks" in
+true) debug "checking for intersecion between '${XDG_CURRENT_DESKTOP-}' and NotShowIn '$value'" ;;
+false)
+debug "skipping NotShowIn check"
+return 0
+;;
+esac
+IFS=';'
+for target in $value; do
+IFS=':'
+for desktop in ${XDG_CURRENT_DESKTOP-}; do
+debug "checking NotShowIn match '$desktop'='$target'"
+[ "$desktop" = "$target" ] && return 1
+done
+done
+return 0
+;;
+'X-TerminalArgExec'*=* | 'TerminalArgExec'*=*)
+de_expand_str "$value"
+EXECARG=$EXPANDED_STR
+EXECARG_DEFINED=true
+debug "read TerminalArgExec '$EXECARG'"
+;;
+'X-ExecArg'*=* | 'ExecArg'*=*)
+case "${EXECARG_COMPAT}" in
+false) return 0 ;;
+esac
+de_expand_str "$value"
+EXECARG=$EXPANDED_STR
+EXECARG_DEFINED=true
+debug "read TerminalArgExec '$EXECARG'"
+;;
+'X-TerminalArgAppId'*=* | 'TerminalArgAppId'*=*)
+de_expand_str "$value"
+APPIDARG=$EXPANDED_STR
+debug "read TerminalArgAppId '$APPIDARG'"
+;;
+'X-TerminalArgTitle'*=* | 'TerminalArgTitle'*=*)
+de_expand_str "$value"
+TITLEARG=$EXPANDED_STR
+debug "read TerminalArgTitle '$TITLEARG'"
+;;
+'X-TerminalArgDir'*=* | 'TerminalArgDir'*=*)
+de_expand_str "$value"
+DIRARG=$EXPANDED_STR
+debug "read TerminalArgDir '$DIRARG'"
+;;
+'X-TerminalArgHold'*=* | 'TerminalArgHold'*=*)
+de_expand_str "$value"
+HOLDARG=$EXPANDED_STR
+debug "read TerminalArgHold '$HOLDARG'"
+;;
+'TryExec'*=*)
+de_expand_str "$value"
+debug "checking TryExec executable '$EXPANDED_STR'"
+command -v "$(printf '%b' "$EXPANDED_STR")" > /dev/null || return 1
+;;
+'Hidden'*=*)
+debug "checking boolean Hidden '$value'"
+case "$value" in
+true)
+debug "ignored Hidden entry"
+return 1
+;;
+esac
+;;
+'Exec'*=*)
+case "$read_exec" in
+false)
+debug "ignored Exec from wrong section"
+return 0
+;;
+esac
+debug "read Exec '$value'"
+de_expand_str "$value"
+de_tokenize_exec "$EXPANDED_STR"
+de_strip_fields
+EXEC0=${EXEC_USEP%%"$USEP"*}
+debug "checking Exec[0] executable '$EXEC0'"
+command -v "$EXEC0" > /dev/null || return 1
+;;
+esac
+}
+alias check_entry_key='IFS= check_entry_key'
+
+read_entry_path() {
+entry_path="$1"
+entry_action="$2"
+de_checks="$3"
+read_exec=false
+action_listed=false
+debug "reading desktop entry '$entry_path'${entry_action:+ action '}$entry_action${entry_action:+'}"
+while IFS="$OIFS" read -r line; do
+case $line in
+'[Desktop Entry]'*) [ -z "$entry_action" ] && read_exec=true ;;
+[a-zA-Z0-9-]*)
+value=${line#*=}
+value=${value#"${value%%[! ]*}"}
+check_entry_key "$line" "$value" "$entry_action" "$read_exec" "$de_checks" && continue
+reset_keys
+debug "entry discarded"
+return 1
+;;
+"[Desktop Action ${entry_action}]"*)
+if [ "$action_listed" = "true" ]; then
+read_exec=true
+else
+debug "action '$entry_action' was not listed in Actions"
+return 1
+fi
+;;
+'['*) [ "$read_exec" = "true" ] && break ;;
+esac
+done < "$entry_path"
+}
+
+validate_entry_id() {
+
+case "$1" in
+*[!a-zA-Z0-9_.-]* | *[!a-zA-Z0-9_.-] | [!a-zA-Z0-9_.-]* | [!a-zA-Z0-9_.-] | '' | .desktop)
+debug "string not valid as Entry ID: '$1'"
+return 1
+;;
+*.desktop) return 0 ;;
+*)
+debug "string not valid as Entry ID '$1'"
+return 1
+;;
+esac
+}
+
+validate_action_id() {
+
+case "$1" in
+'') return 0 ;;
+*[!a-zA-Z0-9-]* | *[!a-zA-Z0-9-] | [!a-zA-Z0-9-]* | [!a-zA-Z0-9-])
+debug "string not valid as Action ID: '$1'"
+return 1
+;;
+*) return 0 ;;
+esac
+}
+
+find_entry() {
+de_checks=false
+IFS="$N"
+for entry_id in ${ENTRY_IDS}${N}//fallback_start//${N}$FALLBACK_ENTRY_IDS; do
+case "$entry_id" in
+*:*)
+entry_action=${entry_id#*:}
+entry_id=${entry_id%:*}
+;;
+'') continue ;;
+'//fallback_start//')
+de_checks=true
+continue
+;;
+*) entry_action='' ;;
+esac
+
+debug "matching path for entry ID '$entry_id'"
+alias "$entry_id" > /dev/null 2>&1 || continue
+eval "$entry_id"
+unalias "$entry_id"
+read_entry_path "$entry_path" "$entry_action" "$de_checks" || continue
+[ -z "${EXEC_USEP}" ] && continue
+[ -z "${IS_TERMINAL}" ] && continue
+if [ "$EXECARG_DEFINED" != "true" ]; then
+if check_bool "$EXECARG_COMPAT"; then
+EXECARG=$(get_default_execarg "$entry_id")
+else
+continue
+fi
+fi
+return 0
+done
+IFS=':' error "No valid terminal entry was found in:" ${APPLICATIONS_DIRS}
+return 1
+}
+alias find_entry='IFS= find_entry'
+
+get_default_execarg() {
+check_entry=$1
+while IFS=':' read -r entry_id execarg_default; do
+case "$entry_id" in
+"$check_entry")
+printf '%s' "$execarg_default"
+debug "custom default TerminalArgExec '$execarg_default' for '$check_entry'"
+return 0
+;;
+esac
+done <<- EOF
+$EXECARG_DEFAULTS
+EOF
+printf '%s' '-e'
+debug "using default TerminalArgExec '-e' for '$check_entry'"
+}
+
+LOWERCASE_XDG_CURRENT_DESKTOP=$(printf '%s' "${XDG_CURRENT_DESKTOP-}" | tr '[:upper:]' '[:lower:]')
+
+EXECARG_COMPAT=${XTE_EXECARG_COMPAT-true}
+EXECARG_COMPAT_CONFIGURED=${XTE_EXECARG_COMPAT-}
+
+EXEC_USEP=''
+EXPANDED_STR=''
+
+APPLICATIONS_DIRS=''
+
+EXECARG_DEFAULTS=''
+
+reset_keys
+
+make_paths
+
+CACHE_ENABLED=${XTE_CACHE_ENABLED-true}
+CACHE_CONFIGURED=${XTE_CACHE_ENABLED-}
+
+HASH=''
+
+if check_bool "${CACHE_ENABLED}" && read_cache; then
+CACHE_USED=true
+else
+CACHE_USED=false
+
+ENTRY_IDS=''
+FALLBACK_ENTRY_IDS=''
+
+EXCLUDED_ENTRY_IDS=''
+INCLUDED_ENTRY_IDS=''
+
+read_config_paths
+find_entry_paths
+
+IFS="$N" debug ">     final entry ID list:" ${ENTRY_IDS} "^     end of final entry ID list"
+IFS="$N" debug ">     final fallback entry ID list:" ${FALLBACK_ENTRY_IDS} "^     end of final fallback entry ID list"
+
+find_entry || exit 1
+fi
+
+debug ">     original args:" "$@" "^     end of original args" "EXEC_USEP=$EXEC_USEP" "EXECARG=$EXECARG"
+
+debug "option processing"
+APPIDVAL=''
+TITLEVAL=''
+DIRVAL=''
+HOLD=false
+TEST_MODE=false
+while [ "$#" -gt "0" ]; do
+case "$1" in
+--)
+debug "found explicit end of options $1"
+shift
+break
+;;
+-e | "$EXECARG")
+debug "found exec arg $1"
+shift
+break
+;;
+--app-id=*)
+debug "found option $1"
+IFS='=' read -r _opt APPIDVAL <<- EOF
+$1
+EOF
+debug "set app-id option to $APPIDVAL"
+shift
+;;
+--title=*)
+debug "found option $1"
+IFS='=' read -r _opt TITLEVAL <<- EOF
+$1
+EOF
+debug "set title option to $TITLEVAL"
+shift
+;;
+--dir=*)
+debug "found option $1"
+IFS='=' read -r _opt DIRVAL <<- EOF
+$1
+EOF
+debug "set dir option to $DIRVAL"
+shift
+;;
+--hold)
+debug "found option $1"
+HOLD=true
+debug "set HOLD=true"
+shift
+;;
+--test)
+debug "found option $1"
+TEST_MODE=true
+debug "set TEST_MODE=true"
+shift
+;;
+[!-]*)
+debug "found non-option $1"
+break
+;;
+-*)
+debug "discarding unknown option $1"
+shift
+;;
+esac
+done
+debug "end of option processing, prependig options"
+
+if [ "$#" -gt 0 ] && [ -n "$EXECARG" ]; then
+set -- "$EXECARG" "$@"
+debug "prepended $1"
+fi
+
+if [ -n "$HOLDARG" ] && check_bool "$HOLD"; then
+set -- "${HOLDARG}" "$@"
+debug "prepended $1"
+elif [ -z "$HOLDARG" ] && check_bool "$HOLD"; then
+debug "terminal entry has no TerminalArgHold="
+fi
+
+if [ -n "$DIRARG" ] && [ -n "$DIRVAL" ]; then
+case "$DIRARG" in
+*=)
+set -- "${DIRARG}${DIRVAL}" "$@"
+debug "prepended $1"
+;;
+*)
+set -- "${DIRARG}" "${DIRVAL}" "$@"
+debug "prepended $1 $2"
+;;
+esac
+elif [ -z "$DIRARG" ] && [ -n "$DIRVAL" ]; then
+debug "terminal entry has no TerminalArgDir="
+fi
+
+if [ -n "$TITLEARG" ] && [ -n "$TITLEVAL" ]; then
+case "$TITLEARG" in
+*=)
+set -- "${TITLEARG}${TITLEVAL}" "$@"
+debug "prepended $1"
+;;
+*)
+set -- "${TITLEARG}" "${TITLEVAL}" "$@"
+debug "prepended $1 $2"
+;;
+esac
+elif [ -z "$TITLEARG" ] && [ -n "$TITLEVAL" ]; then
+debug "terminal entry has no TerminalArgTitle="
+fi
+
+if [ -n "$APPIDARG" ] && [ -n "$APPIDVAL" ]; then
+case "$APPIDARG" in
+*=)
+set -- "${APPIDARG}${APPIDVAL}" "$@"
+debug "prepended $1"
+;;
+*)
+set -- "${APPIDARG}" "${APPIDVAL}" "$@"
+debug "prepended $1 $2"
+;;
+esac
+elif [ -z "$APPIDARG" ] && [ -n "$APPIDVAL" ]; then
+debug "terminal entry has no TerminalArgAppId="
+fi
+
+debug "end of option prepending"
+
+IFS=$USEP
+set -- $EXEC_USEP "$@"
+IFS=$OIFS
+
+debug ">     final args:" "$@" "^     end of final args"
+
+if [ "$CACHE_USED" = "false" ]; then
+save_cache "$1" &
+fi
+
+case "$TEST_MODE" in
+true)
+printf '%s\n' 'Command and arguments:'
+printf '  >%s<\n' "$@"
+exit 0
+;;
+esac
+
+CheckStart="<NOT>"
+TERMINAL="$@"
+ 
+AddTERMINAL="$TERMINAL"
+if echo "xfce-terminal xfce4-terminal mate-terminal gnome-terminal konsole lxterminal qterminal lilyterm deepin-terminal tilix roxterm kitty stterm sakura terminator guake tilda eterm terminology xterm uxterm ptyxis" | grep -w "$AddTERMINAL" 1>/dev/null
+then
+AddTERMINAL=""
+fi
+ 
+echo "#P_I_/bin/bash
+# # # # # # # # # # # # ## # # # # # # # # # # ## # # # # # # # # # # ## # # # # # # # # # # # # ## 
+# UpDates
+# GkPackage
+clear
+Online=@<YES>@ 
+RESULT=_V_wget --spider https://www.google.com 2>&1_V_
+FLAG=0
+for x in SYD_RESULT; do
+if [ @SYD_x@ = '200' ]; then
+FLAG=1
+fi
+done
+if [ SYD_FLAG -eq '0' ]; then
+echo @#P_I_/bin/bash
+clear
+echo @Check that your internet is not online...@
+echo @Press enter to exit@
+sleep 1
+read NotOnline
+sleep 0.5
+if [ @SYD_NotOnline@ = @@ ]; then
+exit -0
+fi
+#@ > /tmp/.GKWhoUSER/StartUpdateGkPackage
+chmod a+rwx /tmp/.GKWhoUSER/StartUpdateGkPackage
+Online=@<NOT>@ 
+fi
+if [ SYD_FLAG -eq '1' ]; then
+echo @online@
+fi
+
+rm -f --force /tmp/.GKWhoUSER/FoundTerm.info
+#
+CheckTerm=@<YES>@ 
+################################# CheckTerm ############################################
+if [ @SYD_CheckTerm@ = @<YES>@ ]; then
+TERMINAL=@@
+TERMS=(xfce-terminal xfce4-terminal mate-terminal gnome-terminal konsole lxterminal qterminal lilyterm deepin-terminal tilix roxterm kitty stterm sakura terminator guake tilda eterm terminology xterm uxterm ptyxis $AddTERMINAL)
+for CheckTerm in SYD_{TERMS[*]}
+do
+if command -v SYD_CheckTerm | grep -iE @xfce-terminal|xfce4-terminal|mate-terminal|gnome-terminal|konsole|lxterminal|qterminal|lilyterm|deepin-terminal|tilix|roxterm|kitty|stterm|sakura|terminator|guake|tilda|eterm|terminology|xterm|uxterm|ptyxis|$AddTERMINAL@ 
+then
+echo @<DONE>  <_>  SYD_CheckTerm@  > /tmp/.GKWhoUSER/FoundTerm.info
+break
+else
+echo @<TerminalNotFound>@  > /tmp/.GKWhoUSER/FoundTerm.info
+fi
+done
+fi
+################################# CheckTerm ############################################
+#
+#  echo @<TerminalNotFound>@  > /tmp/.GKWhoUSER/FoundTerm.info
+#
+if [ @SYD_FoundTermInfo@ = @<TerminalNotFound>@ ]; then
+################################# CheckTerm2 ############################################
+rm -f --force /tmp/.GKWhoUSER/FoundTerm.info
+################################# CheckTerm2 ############################################
+fi
+#
+if [ -f @/tmp/.GKWhoUSER/FoundTerm.info@ ]
+then
+FoundTermInfo=SYD_(cat  /tmp/.GKWhoUSER/FoundTerm.info  | grep  -i  @<TerminalNotFound>@  | awk '{ print SYD_1}' |head -1 )
+TERMINAL=SYD_(cat /tmp/.GKWhoUSER/FoundTerm.info | grep -iwE  @xterm|uxterm@  | awk '{ print SYD_NF}' |head -1 )
+fi
+#
+ 
+if [ -f @/tmp/.GKWhoUSER/FoundTerm.info@ ]
+then
+FoundTerm=SYD_(cat /tmp/.GKWhoUSER/FoundTerm.info | awk '{ print SYD_1}' |head -1)
+fi
+################################### UpdateGkPackage<Script>
+#
+#
+if [ @SYD_FoundTerm@ = @<DONE>@ ]; then
+if [ @SYD_Online@ = @<YES>@ ]; then
+rm -Rf --force /tmp/.GKWhoUSER/*TempDirTar*
+fi
+rm -Rf --force /tmp/.GKWhoUSER/*TempDirTar*
+sleep 0.5
+fi 
+#
+#
+if [ P_I_ @SYD_FoundTermInfo@ = @<TerminalNotFound>@ ]; then
+if  echo @SYD_TERMINAL@  | grep -iwE  @xterm|uxterm@
+then
+SYD_TERMINAL  -fa 'Monospace' -fs 20 -fg white -bg black  -e /tmp/.GKWhoUSER/StartUpdateGkPackage && exit; bash;
+fi
+fi
+#
+if [ P_I_ @SYD_FoundTermInfo@ = @<TerminalNotFound>@ ]; then
+TERMINAL=SYD_(cat /tmp/.GKWhoUSER/FoundTerm.info  | awk '{ print SYD_NF}' |head -1 )
+exec @SYD_TERMINAL@ -e /tmp/.GKWhoUSER/StartUpdateGkPackage && exit; bash; 2>/dev/null
+fi" | sed 's/uxterm|@/uxterm@/g' | sed 's/uxterm )/uxterm)/g' | tr '@' '"'  | sed "s/SYD_/$/g" | sed "s/P_I_/@/g" | tr "@" "!"  | sed 's/_V_/`/g' > /tmp/.GKWhoUSER/CheckTerm.sh
+sleep 0.5
+
+mkdir -p /tmp/.GKWhoUSER
+rm -f --force /tmp/.GKWhoUSER/StartUpdateGkPackage
+cat <<'EOF' >> /tmp/.GKWhoUSER/StartUpdateGkPackage
+#!/bin/bash
+# # # # # # # # # # # # ## # # # # # # # # # # ## # # # # # # # # # # ## # # # # # # # # # # # # # 
+# AddAndRemoveAppsPortable
+# GkPackage 
+# GkPackage Software Manager for AppImage is a voluntary and nonprofit (GPL license) project. And 
+#everything possible is done to ensure that everything work good and it's safe to install. If you 
+#decide to install this AppImage app in your Linux system you do it at your own risk.
+# By Gioank
+# # # # # # # # # # # # ## # # # # # # # # # # ## # # # # # # # # # # ## # # # # # # # # # # # 
+#  
+################################### UpdateGkPackage<Script>
+clear
+WhoUser=$(cat /tmp/.GKWhoUSER/USER.info)
+##################### GkPackage Theme #####################
+ThemeGK_Gtk=""
+GkThemeTemp=""
+ThemeGK_Gtk=$(head -1 /home/$WhoUser/.GkAppImageLocal/FalseTrue_Theme |tail -1)
+if [ "$ThemeGK_Gtk" = "" ]; then
+ThemeGK_Gtk="FALSE"
+fi
+echo -ne '\e]11;#383838\e\\' 
+ColorTXT=`echo "\033[37m"` 
+ColorTitle=`echo "\033[33m"` #yellow
+if [ "$ThemeGK_Gtk" = "TRUE" ]; then
+GTK_THEME=""
+GTKTHEME=""
+ThemeGK_Gtk=""
+CheckFalseTrue_Theme=$(head -2 /home/$WhoUser/.GkAppImageLocal/FalseTrue_Theme |tail -1)
+if [ "$CheckFalseTrue_Theme" = "Dark" ]; then
+echo -ne '\e]11;#000000\e\\'
+ColorTXT=`echo "\033[37m"`   
+fi
+if [ "$CheckFalseTrue_Theme" = "Light" ]; then
+echo -ne '\e]11;#E0D6D6\e\\'
+ColorTXT=`echo "\033[30m"`
+ColorTitle=`echo "\033[36m"` #yellow
+fi
+if [ "$CheckFalseTrue_Theme" = "Future-Dark" ]; then
+echo -ne '\e]11;#000000\e\\' 
+ColorTXT=`echo "\033[37m"`  
+fi
+if [ "$CheckFalseTrue_Theme" = "Future-Light" ]; then
+echo -ne '\e]11;#E0D6D6\e\\'
+ColorTXT=`echo "\033[30m"`
+ColorTitle=`echo "\033[36m"` #yellow
+fi
+fi
+
+ColorLangExit="\033[31m"
+Language=$(cat $HOME/.GkAppImageLocal/Lang.info)
+if [ "$Language" = "" ]; then
+Language="en"
+fi
+LangThisOpRootPassword=$(head -183 /opt/AddRemove_AppsPortable/GkRepoApp/.lang/$Language | tail -1)
+PosDirLang="/opt/AddRemove_AppsPortable/SudoGui"
+LangInsertPassword1=$(head -3 $PosDirLang/.lang/$Language | tail -1)
+LangInsertPassword2=$(head -16 $PosDirLang/.lang/$Language | tail -1)
+LangBotExit=$(head -4  $PosDirLang/.lang/$Language | tail -1)
+LangInsertPassword="$LangInsertPassword1 
+$LangInsertPassword2"
+rm -f --force /tmp/.GKWhoUSER/UpDateGKList_TEMP
+cat /tmp/.GKWhoUSER/Info_UpDateGK.list | grep -i "<_LIST_>" |awk '{ print $2}' | while read InfoUpDateGkP
+do
+CheckUpDateDONE=""
+if [ -f "/opt/AddRemove_AppsPortable/.DirUpdateGkPackage/InfoDone_UpDateGK.list" ]
+then
+CheckUpDateDONE=$(cat /opt/AddRemove_AppsPortable/.DirUpdateGkPackage/InfoDone_UpDateGK.list | grep -w "$InfoUpDateGkP" |awk '{ print $1}' |head -1)
+fi
+if [ "$InfoUpDateGkP" = "$CheckUpDateDONE" ]; then
+cat /opt/AddRemove_AppsPortable/.DirUpdateGkPackage/InfoDone_UpDateGK.list | grep -w "$InfoUpDateGkP" >> /tmp/.GKWhoUSER/UpDateGKList_TEMP
+else
+cat /tmp/.GKWhoUSER/Info_UpDateGK.list | grep -i "<_LIST_>" | grep -w "$InfoUpDateGkP" |awk '{ print $2,$3,$4,"<*>"}' >> /tmp/.GKWhoUSER/UpDateGKList_TEMP
+fi
+sleep 0.5
+done
+killall /opt/AddRemove_AppsPortable/usr/bin/YadGetUpDateGkPackage 2>/dev/null
+InfoDoneUpDateGkPList=$(cat /tmp/.GKWhoUSER/UpDateGKList_TEMP | cat -n |awk '{ print $0}' | sed '/^$/d' | sed '$!N; /^\(.*\)\n\1$/!P; D' | sort -k 1 | uniq |awk '{ print "<"$1">",$2,$3,$4,$5}')
+echo "$LangThisOpRootPassword
+-----------------------------------------------------------------
+Menu Update GkPackage 18 choose the update you want to update!
+-----------------------------------------------------------------
+$InfoDoneUpDateGkPList"
+GetUpDateGk=""
+echo "<0> $LangBotExit"
+printf ">_"
+read NumUpDateList
+if [ "$NumUpDateList" = "0" ]; then
+clear
+exit -0
+fi
+
+GetName7z=$(echo "$InfoDoneUpDateGkPList" | grep -i "<$NumUpDateList>"  |awk '{ print $4}' | head -1)
+TypeUpdateGkP=$(echo "$InfoDoneUpDateGkPList" | grep -i "<$NumUpDateList>"  |awk '{ print $3}' | head -1)
+CheckDoneUpdateGkP=$(echo "$InfoDoneUpDateGkPList" | grep -i "<$NumUpDateList>"  |awk '{ print $NF}' | head -1)
+LangExit=`head -18 /opt/AddRemove_AppsPortable/GkRepoApp/.lang/Shell/$Language  |tail -1 | grep -i "0>"` 
+
+clear
+echo "-----------------------------------------------------------------
+Menu Update GkPackage 18 choose the update you want to update!
+-----------------------------------------------------------------"
+TXTSEL="$NumUpDateList<*> $GetName7z"
+if [ $(id -u) -ne 0 ]
+then 
+unset PasswordRoot
+unset CHARCOUNT
+#
+printf "${ColorTXT}$TXTSEL\n"
+printf "\n${ColorLangExit}$LangExit\n"
+echo -e -n "\e[33m\n$LangInsertPassword\e[0m\n>"
+stty -echo
+CHARCOUNT=0
+while IFS= read -p "$PROMPT" -r -s -n 1 CHAR
+do
+#
+if [[ $CHAR == $'\0' ]] ; then
+break
+fi
+#
+if [[ $CHAR == $'\177' ]] ; then
+if [ $CHARCOUNT -gt 0 ] ; then
+CHARCOUNT=$((CHARCOUNT-1))
+PROMPT=$'\b \b'
+PasswordRoot="${PasswordRoot%?}"
+else
+PROMPT=''
+fi
+else
+CHARCOUNT=$((CHARCOUNT+1))
+PROMPT='*'
+PasswordRoot+="$CHAR"
+fi
+done
+stty echo
+clear
+if [ "$PasswordRoot" = "0" ]; then
+/tmp/.GKWhoUSER/StartUpdateGkPackage
+exit -0
+fi
+EOF
+echo 'if su -l &> /dev/null << EOF
+$PasswordRoot
+EOF
+then' >> /tmp/.GKWhoUSER/StartUpdateGkPackage
+cat <<'EOF' >> /tmp/.GKWhoUSER/StartUpdateGkPackage
+
+WhoUser=$(cat /tmp/.GKWhoUSER/USER.info)
+##################################################################
+rm -Rf --force /home/$WhoUser/.GkAppImageLocal/AppFirstRun 2>/dev/null
+rm -Rf --force /home/$WhoUser/.GkAppImageLocal/.ConfigGk 2>/dev/null
+rm -f --force /home/$WhoUser/.GkAppImageLocal/AppsInstalled/ListAppsInstalled.list 2>/dev/null
+rm -Rf --force /home/$WhoUser/.GkAppImageLocal/AppImageNotInstalled/* 2>/dev/null
+rm -Rf --force /home/$WhoUser/.GkAppImageLocal/GkRepoApp/Repos/* 2>/dev/null
+rm -Rf --force /home/$WhoUser/.GkAppImageLocal/TEMP/* 2>/dev/null
+rm -f --force /home/$WhoUser/.GkAppImageLocal/Repositories_AppImage/ListGkRepoApp.list 2>/dev/null
+rm -f --force /home/$WhoUser/.GkAppImageLocal/Repositories_AppImage/Repositories_AppImage.list 2>/dev/null
+sleep 0.5
+killall /opt/AddRemove_AppsPortable/usr/bin/YadGkStartIcon 2>/dev/null
+killall /opt/AddRemove_AppsPortable/usr/bin/yad 2>/dev/null
+killall /opt/AddRemove_AppsPortable/usr/bin/DownloadYad 2>/dev/null
+killall /opt/AddRemove_AppsPortable/usr/bin/GkRepoYad 2>/dev/null
+killall /opt/AddRemove_AppsPortable/usr/bin/InfoQuickAppYad 2>/dev/null
+killall /opt/AddRemove_AppsPortable/usr/bin/yadAppDir 2>/dev/null
+killall /opt/AddRemove_AppsPortable/usr/bin/YADApply_EXSRE 2>/dev/null
+killall /opt/AddRemove_AppsPortable/usr/bin/YadDownload 2>/dev/null
+killall /opt/AddRemove_AppsPortable/usr/bin/YadGetUpDateGkPackage 2>/dev/null
+killall /opt/AddRemove_AppsPortable/usr/bin/yadGK 2>/dev/null
+sleep 0.5
+killall /opt/AddRemove_AppsPortable/usr/bin/YadInfoAppImage 2>/dev/null
+killall /opt/AddRemove_AppsPortable/usr/bin/YADINSTALL_CP 2>/dev/null
+killall /opt/AddRemove_AppsPortable/usr/bin/YadRestoreMenuApp 2>/dev/null
+killall /opt/AddRemove_AppsPortable/usr/bin/YadRunInfoApp 2>/dev/null
+##################################################################
+#
+#
+if [ "$TypeUpdateGkP" = "<GkRepo>" ]; then
+DirOptUpD="/opt/AddRemove_AppsPortable/GkRepoApp/Repos"
+fi
+#
+#
+if [ "$TypeUpdateGkP" = "<UpDateGkP>" ]; then
+DirOptUpD="/opt/AddRemove_AppsPortable"
+rm -f --force /tmp/.GKWhoUSER/UpDateGkPR.sh
+echo "
+rm -f --force /usr/bin/gkrepo
+rm -f --force /usr/bin/gkcre-app
+rm -f --force /usr/bin/gkcre-dir
+rm -f --force /usr/bin/gkext-app
+rm -f --force /usr/bin/gkhelpshell
+rm -f --force /usr/bin/uninstallgkpackage
+rm -f --force /usr/bin/StartRemoveAllGkPackage
+rm -f --force /usr/bin/removeallgkpackage
+rm -f --force /usr/bin/gkquickguide
+rm -f --force /usr/bin/addupdategkrepo
+rm -f --force /usr/bin/GkWget
+#
+ln -s /opt/AddRemove_AppsPortable/QuickMenuGuideShell.sh /usr/bin/gkhelpshell
+ln -s /opt/AddRemove_AppsPortable/GkRepoApp/AddLinkApp/gkrepo /usr/bin/gkrepo
+ln -s /opt/AddRemove_AppsPortable/usr/CreateAppimageShell.sh /usr/bin/gkcre-app
+ln -s /opt/AddRemove_AppsPortable/usr/CreateAppDirHere.sh /usr/bin/gkcre-dir
+ln -s /opt/AddRemove_AppsPortable/usr/ExtractAppImageHereShell.sh /usr/bin/gkext-app
+ln -s /opt/AddRemove_AppsPortable/.UninstallGkPackage/uninstallgkpackage /usr/bin/uninstallgkpackage
+ln -s /opt/AddRemove_AppsPortable/QuickMenuGuideShell.sh /usr/bin/gkquickguide
+ln -s /opt/AddRemove_AppsPortable/GkRepoApp/AddLinkApp/Start_AddUpdateFromFileGkRepo.sh /usr/bin/addupdategkrepo
+ln -s  /opt/AddRemove_AppsPortable/usr/bin/GkWget /usr/bin/GkWget
+ln -s  /opt/AddRemove_AppsPortable/Info_UpDateGK_Shell.sh /usr/bin/updategkp
+#
+cp -f --force /opt/AddRemove_AppsPortable/.UninstallGkPackage/StartRemoveAllGkPackage /usr/bin/StartRemoveAllGkPackage
+cp -f --force /opt/AddRemove_AppsPortable/.UninstallGkPackage/removeallgkpackage /usr/bin/removeallgkpackage
+" > /tmp/.GKWhoUSER/UpDateGkPR.sh
+chmod a+rwx /tmp/.GKWhoUSER/UpDateGkPR.sh
+fi
+
+rm -f --force /tmp/.GKWhoUSER/InfoDone_UpDateGK.list_OPT_TEMP
+if [ -f "/opt/AddRemove_AppsPortable/.DirUpdateGkPackage/InfoDone_UpDateGK.list" ]
+then
+cat /opt/AddRemove_AppsPortable/.DirUpdateGkPackage/InfoDone_UpDateGK.list | sed "/$TypeUpdateGkP/d" > /tmp/.GKWhoUSER/InfoDone_UpDateGK.list_OPT_TEMP
+sleep 0.5
+echo "
+#
+" >> /tmp/.GKWhoUSER/InfoDone_UpDateGK.list_OPT_TEMP
+sleep 0.5
+cat /tmp/.GKWhoUSER/Info_UpDateGK.list | grep -w "$TypeUpdateGkP" |awk '{ print $2,$3,$4,"<DONE>"}' | head -1 >> /tmp/.GKWhoUSER/InfoDone_UpDateGK.list_OPT_TEMP
+fi
+
+if [ ! -f "/opt/AddRemove_AppsPortable/.DirUpdateGkPackage/InfoDone_UpDateGK.list" ]
+then
+mkdir -p /opt/AddRemove_AppsPortable/.DirUpdateGkPackage
+cat /tmp/.GKWhoUSER/Info_UpDateGK.list | grep -w "$TypeUpdateGkP" |awk '{ print $2,$3,$4,"<DONE>"}' | head -1  >> /tmp/.GKWhoUSER/InfoDone_UpDateGK.list_OPT_TEMP 
+sleep 0.5
+echo "
+#
+" >> /tmp/.GKWhoUSER/InfoDone_UpDateGK.list_OPT_TEMP
+fi
+
+
+echo "#P_I_/bin/bash 
+if [ ! -d @/opt/AddRemove_AppsPortable/.DirUpdateGkPackage@ ]
+then
+mkdir -p /opt/AddRemove_AppsPortable/.DirUpdateGkPackage
+fi
+CheckUpdateGkPackage=@<YES>@
+cd /tmp/
+rm -f --force /tmp/$GetName7z
+rm -f --force /tmp/DONE
+cat /tmp/.GKWhoUSER/Info_UpDateGK.list | grep -i @<_LinkUpDateGkPR_>@ | grep -i @$GetName7z@ |sed 's/<_LinkUpDateGkPR_>/ /g' | grep -i @.7zSYD_@ |awk '{ print SYD_NF}' | while read LinkUpDateGkP
+do
+if [ -f @/opt/AddRemove_AppsPortable/usr/bin/wget@ ]
+then
+GkWget=@/opt/AddRemove_AppsPortable/usr/bin/wget@
+fi
+if [ -f @/opt/AddRemove_AppsPortable/usr/bin/GkWget@ ]
+then
+GkWget=@/opt/AddRemove_AppsPortable/usr/bin/GkWget@
+fi
+if SYD_GkWget SYD_LinkUpDateGkP; then
+echo @<DONE>@ > /tmp/DONE
+break
+fi 
+done
+#
+if [ ! -f @/tmp/$GetName7z@ ]
+then
+echo @Error@
+sleep 2.5
+exit -0
+fi
+#
+if [ -f @/tmp/DONE@ ]
+then
+if [ -f @/tmp/$GetName7z@ ]
+then
+cd $DirOptUpD
+/opt/AddRemove_AppsPortable/usr/bin/7z x /tmp/$GetName7z -y
+if [ -f @$DirOptUpD/UpdScript.sh@ ]
+then
+sleep 1
+chmod a+rwx $DirOptUpD/UpdScript.sh
+sleep 0.5
+bash -c $DirOptUpD/UpdScript.sh
+fi
+echo @DONE@
+sleep 2.5
+fi
+fi
+#
+cat /tmp/.GKWhoUSER/InfoDone_UpDateGK.list_OPT_TEMP | sed '/^SYD_/d' | sed 'SYD_!N; /^\(.*\)\n\1SYD_/!P; D' > /opt/AddRemove_AppsPortable/.DirUpdateGkPackage/InfoDone_UpDateGK.list
+" | tr '@' '"' | sed "s/SYD_/$/g" | sed "s/P_I_/@/g" | tr "@" "!" > /tmp/.GKWhoUSER/GkWget.sh
+chmod a+rwx /tmp/.GKWhoUSER/GkWget.sh
+sleep 0.5
+echo $PasswordRoot | su root -c /tmp/.GKWhoUSER/GkWget.sh 2>/dev/null
+gkcommand="NOT"
+if [ "$TypeUpdateGkP" = "<UpDateGkP>" ]; then
+echo $PasswordRoot | su root -c /tmp/.GKWhoUSER/UpDateGkPR.sh 2>/dev/null
+sleep 0.5
+BASH=$(cd /opt/AddRemove_AppsPortable/
+./ReCreateAllList.sh INFOCreateListAppInstalled 2>/dev/null) &
+fi
+
+if [ "$TypeUpdateGkP" = "<GkRepo>" ]; then
+echo $PasswordRoot | su root -c /opt/AddRemove_AppsPortable/GkRepoApp/AddLinkApp/ReCreateOpt_List_All_Repo 2>/dev/null
+sleep 0.5
+BASH=$(cd /opt/AddRemove_AppsPortable/
+./GkPackageSoftwareManager.sh 2>/dev/null) &
+fi
+sleep 0.5
+/tmp/.GKWhoUSER/StartUpdateGkPackage
+else
+/tmp/.GKWhoUSER/StartUpdateGkPackage
+exit -0
+fi
+fi
+EOF
+
+rm -f --force /tmp/.GKWhoUSER/Info_UpDateGK.list
+cat <<'EOF' >> /tmp/.GKWhoUSER/Info_UpDateGK.list
+<_LIST_><1> UpDateGkP_30-06-2026 <UpDateGkP> UpDateGkP_30-06-2026.7z
+<_LIST_><2> UpDateGkR_30-06-2026 <GkRepo> UpDateGkR_30-06-2026.7z
+#
+<_LinkUpDateGkPR_>https://gitlab.com/gkpackage/gkpackage/-/raw/main/UpDateGkP_30-06-2026.7z
+<_LinkUpDateGkPR_>https://gitlab.com/gkpackage/gkpackage/-/raw/main/UpDateGkR_30-06-2026.7z
+#
+<_LinkUpDateGkPR_>https://archive.org/download/up-date-gk-p-30-06-2026.7z/UpDateGkP_30-06-2026.7z
+<_LinkUpDateGkPR_>https://archive.org/download/up-date-gk-r-29-06-2026.7z/UpDateGkR_30-06-2026.7z
+#
+<_LinkUpDateGkPR_>http://gkpackage.tuxfamily.org/Download/UpDateGkP_30-06-2026.7z
+<_LinkUpDateGkPR_>http://gkpackage.tuxfamily.org/Download/UpDateGkR_30-06-2026.7z
+#
+EOF
+
+chmod a+rwx /tmp/.GKWhoUSER/StartUpdateGkPackage
+ 
+chmod a+rwx /tmp/.GKWhoUSER/CheckTerm.sh
+if [ -f "/tmp/.GKWhoUSER/CheckTerm.sh" ]
+then
+bash -c /tmp/.GKWhoUSER/CheckTerm.sh
+fi
